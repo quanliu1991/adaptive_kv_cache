@@ -1,5 +1,6 @@
 import inspect
 import json
+import os
 
 import torch
 
@@ -10,50 +11,76 @@ class Policies:
                              for method in dir(self) if
                              inspect.ismethod(getattr(self, method)) and
                              method.split("_")[-1] == "policies"}
-        with open("config.json","r") as f:
+        self.config_path = os.path.dirname(__file__).replace("adaptive_kv_cache/adapter_kv_cache", "adaptive_kv_cache/adapter_kv_cache/configs/config.json")
+        with open(self.config_path,"r") as f:
             config = json.load(f)
-
-        self.special_token_table = config.special_token_table
-        self.punctuation_table = config.punctuation_table
-        self.locality_length = config.locality_length
-        self.top_frequency = config.top_frequency
-    def special_policies(self, token_id) -> tuple[torch.Tensor, list]:
+        self.num_heads=32 # todo
+        self.special_token_table = config.get("special_token_ids")
+        self.punctuation_table = config.get("punctuation_token_ids")
+        self.locality_length = config.get("locality_length")
+        self.top_frequency = config.get("top_p_frequency")
+    def special_policies(self, token_ids):
         """
         :param token_id:
         :return:
         """
-        id_index = []
-        special_token_id = token_id
+        id_indexs = set()
+        for special_token in self.special_token_table:
+            indices = (token_ids == special_token).nonzero().tolist()
+            for i in indices:
+                id_indexs.add(i[1])
 
-        return special_token_id, id_index
+            # id_indexs = {}
+            # for i, token_id in enumerate(token_ids):
+            #     if token_id in self.special_token_table:
+            #         id_indexs.append(i)
+        head_token_indexs={i:id_indexs for i in range(self.num_heads)}
 
-    def punctuation_policies(self, token_id) -> tuple[torch.Tensor, list]:
-        id_index = []
-        punctuation_token_id = token_id
-        return punctuation_token_id, id_index
+        return head_token_indexs
 
-    def locality_policies(self, token_id) -> tuple[torch.Tensor, list]:
-        id_index = []
-        locality_tokrn_id = token_id[:self.locality_length]
-        return locality_tokrn_id, id_index
+    def punctuation_policies(self, token_ids):
+        id_indexs = set()
+        for punctuation_token in self.punctuation_table:
+            indices = (token_ids == punctuation_token).nonzero().tolist()
+            for i in indices:
+                id_indexs.add(i[1])
+        head_token_indexs = {i: id_indexs for i in range(self.num_heads)}
+        return head_token_indexs
+
+    def locality_policies(self, token_ids) -> list:
+        seq_len = token_ids.shape[-1]
+        compose_seq_len = int(seq_len * self.locality_length)
+        id_indexs = [i for i in range(seq_len-compose_seq_len,seq_len)]
+        head_token_indexs = {i: set(id_indexs) for i in range(self.num_heads)}
+        return head_token_indexs
 
     def frequency_policies(self, attention_score) -> tuple[torch.Tensor, list]:
-        id_index = []
-        frequency_tokrn_id = attention_score[:self.top_frequency]
-        return frequency_tokrn_id, id_index
+        id_index = set()
+        head_token_indexs={}
+        attention_score_sum = torch.sum(attention_score, dim=-2)
+        for head in range(self.num_heads):
+            attention_score_sum_head = attention_score_sum[0,head,:]
+            top_k = int(self.top_frequency*len(attention_score_sum_head))
+            top_values, top_indices = torch.topk(attention_score_sum_head, k=top_k)
+            head_token_indexs.update({head:set(top_indices.tolist())})
+        return head_token_indexs
 
     def full_policies(self, token_id) -> tuple[torch.Tensor, list]:
-        id_index = [i for i in range(token_id.shape[1])]
-        return id_index
+        id_indexs = [i for i in range(token_id.shape[1])]
+        head_token_indexs = {i: set(id_indexs) for i in range(self.num_heads)}
+        return head_token_indexs
 
 
     def get_adapter_tokens_index(self, policies_hybrid: list, token_id=None, attention_score=None):
-        tokens_index = []
+        tokens_index = set()
+        head_tokens_index_union = {i:tokens_index for i in range(self.num_heads)}
         for policies in policies_hybrid:
             assert policies in list(self.policies_map.keys()), f"{policies} not in policies_map."
             input_ = attention_score if policies == "frequency" else token_id
-            tokens_index.append(self.policies_map[policies](input_))
-        return tokens_index
+            head_token_indexs = self.policies_map[policies](input_)
+            for head in head_tokens_index_union.keys():
+                head_tokens_index_union[head] = head_token_indexs[head].union(head_tokens_index_union[head])
+        return head_tokens_index_union
 
 
 class PoliciesManager:
