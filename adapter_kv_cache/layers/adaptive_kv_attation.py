@@ -1,14 +1,22 @@
 import math
+import os.path
 from dataclasses import dataclass
 from typing import Optional, Tuple
 import torch
 from torch import nn
 import fairscale.nn.model_parallel.initialize as fs_init
-from adapter_kv_cache.kv_cache_adapter import KVCacheAdapter
+from adapter_kv_cache.kv_cache.kv_cache_adapter import KVCacheAdapter
 import torch.nn.functional as F
 from fairscale.nn.model_parallel.layers import (
     ColumnParallelLinear,
     RowParallelLinear)
+import logging
+
+log_dir = os.path.dirname(__file__).replace("adapter_kv_cache/layers", "logs")
+os.makedirs(log_dir, exist_ok=True)
+log_path = os.path.join(log_dir, "test.log")
+logging.basicConfig(filename=log_path, level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+
 
 @dataclass
 class ModelArgs:
@@ -27,6 +35,7 @@ class ModelArgs:
 
 class Attention(nn.Module):
     """Multi-head attention module."""
+
     def __init__(self, args: ModelArgs):
         """
         Initialize the Attention module.
@@ -103,11 +112,11 @@ class Attention(nn.Module):
         ).cuda()
 
     def forward(
-        self,
-        x: torch.Tensor,
-        start_pos: int,
-        freqs_cis: torch.Tensor,
-        mask: Optional[torch.Tensor],
+            self,
+            x: torch.Tensor,
+            start_pos: int,
+            freqs_cis: torch.Tensor,
+            mask: Optional[torch.Tensor],
     ):
         """
         Forward pass of the attention module.
@@ -122,7 +131,6 @@ class Attention(nn.Module):
             torch.Tensor: Output tensor after attention.
 
         """
-        print("this is attention")
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
@@ -130,15 +138,13 @@ class Attention(nn.Module):
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
-        print()
-
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
         self.cache_k = self.cache_k.to(xq)
         self.cache_v = self.cache_v.to(xq)
 
-        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
-        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+        self.cache_k[:bsz, start_pos: start_pos + seqlen] = xk
+        self.cache_v[:bsz, start_pos: start_pos + seqlen] = xv
 
         keys = self.cache_k[:bsz, : start_pos + seqlen]
         values = self.cache_v[:bsz, : start_pos + seqlen]
@@ -148,8 +154,8 @@ class Attention(nn.Module):
         values = repeat_kv(values, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
 
         xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        keys = keys.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
-        values = values.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        values = values.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
         if mask is not None:
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
@@ -157,11 +163,13 @@ class Attention(nn.Module):
         output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
-    
+
+
 class AdaptiveCacheAttention(Attention):
-    def __init__(self, args):
+    def __init__(self, args, layer_id):
         super().__init__(args)
-        self.kv_cache_adapter = KVCacheAdapter(t=0.95,cache_k=self.cache_k,cacke_v=self.cache_v)
+        self.kv_cache_adapter = KVCacheAdapter(cache_k=self.cache_k, cacke_v=self.cache_v)
+        self.layer_id = layer_id
 
     def forward(self, x: torch.Tensor,
                 start_pos: int,
@@ -175,13 +183,12 @@ class AdaptiveCacheAttention(Attention):
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
-        # todo 判断是否需要adaptive_kv_cache
+
         is_prefill = xq.shape[1] > 1
         if is_prefill:
-            output = self.kv_cache_adapter.prefill(xq, xk, xv, mask, tokens)  #
+            output = self.kv_cache_adapter.prefill(xq, xk, xv, mask, tokens, self.layer_id)  #
         else:
             output = self.kv_cache_adapter.decode(xq, xk, xv)
-        k,v=self.kv_cache_adapter.kv_cache_manager.get()
 
         return self.wo(output)
 
@@ -196,6 +203,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
         .expand(bs, slen, n_kv_heads, n_rep, head_dim)
         .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
     )
+
 
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     """
@@ -252,5 +260,3 @@ def apply_rotary_emb(
     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
-
-

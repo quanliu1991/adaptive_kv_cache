@@ -1,4 +1,5 @@
 {
+    "t": 0.95,
     "top_p_frequency": 0.8,
     "locality_length": 0.8,
     "punctuation_list": [

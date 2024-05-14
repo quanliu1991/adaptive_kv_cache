@@ -1,25 +1,31 @@
+import os.path
+
 import torch
 import matplotlib.pyplot as plt
 
 
-def image_scores(scores: torch.Tensor):
-    bs, num_heads, seq_len,seq_len = map(int, scores.shape)
+def image_scores(scores: torch.Tensor, layer_id):
+    bs, num_heads, q_seq_len, k_seq_len = map(int, scores.shape)
 
-    rows = bs
-    cols = num_heads
+    rows = 4
+    cols = int(num_heads/rows)
 
-    fig, axs = plt.subplots(rows, cols, figsize=(15, 5))
-
-    for i in range(rows):
-        for j in range(cols):
-            slice_tensor = scores[i, j, :, :]
-            slice_np = slice_tensor.cpu().numpy()
+    fig, axs = plt.subplots(rows, cols, figsize=(30, 10))
 
 
-            axs[i][j].imshow(slice_np, cmap='hot', interpolation='nearest')
-            axs[i][j].set_title(f'b {i + 1} h {j+1}')
-            axs[i][j].axis('off')
+    for i in range(32):
+        slice_tensor = scores[0, i, :, :]
+        slice_np = slice_tensor.cpu().numpy()
+
+
+        axs[i%rows][i//rows].imshow(slice_np, cmap='hot', interpolation='nearest')
+        axs[i%rows][i//rows].set_title(f'h{i+1}')
+        axs[i%rows][i//rows].axis('off')
 
     plt.tight_layout()
-    plt.savefig('attention_heatmap.png')
-    plt.show()
+    image_path = os.path.join(os.path.dirname(os.path.dirname(__file__)),"images")
+    os.makedirs(image_path,exist_ok=True)
+
+    plt.savefig(os.path.join(image_path,f'layer{layer_id}_attention.png'))
+
+
